@@ -7,7 +7,7 @@ const GStr = goose.core.value.GStr;
 const MyInterface = struct {
     conn: *Connection,
     ThisIsAProps: goose.Property(i32, .ReadWrite) = goose.property(i32, .ReadWrite, 43),
-    thisIsAsignal: goose.Signal(GStr) = signal("thisIsAsignal", GStr),
+    ThisIsASignal: goose.Signal(GStr) = signal("ThisIsASignal", GStr),
 
     pub const INTERFACE_NAME = "dev.myinterface.test";
 
@@ -20,7 +20,7 @@ const MyInterface = struct {
     pub fn Testing(self: *MyInterface) !GStr {
         std.debug.print("MyInterface.Testing called!\n", .{});
         std.debug.print("Prop value: {d}\n", .{self.ThisIsAProps.value});
-        try self.thisIsAsignal.trigger(self.conn, GStr.new("from the random Signal"));
+        try self.ThisIsASignal.trigger(self.conn, GStr.new("from the random Signal"));
         return GStr.new("Hello");
     }
 };
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     // entering the dispatch loop.  triggerSignal (used internally by
     // Signal.trigger) is protected by send_mutex, so this is safe even when
     // another task might be dispatching concurrently.
-    try obj.thisIsAsignal.trigger(&conn, GStr.new("startup signal"));
+    try obj.ThisIsASignal.trigger(&conn, GStr.new("startup signal"));
 
     // Dispatch up to 64 messages then exit (for non-interactive testing).
     // Production code would run this loop forever or until a stop flag is set.
