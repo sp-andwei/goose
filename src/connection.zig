@@ -21,6 +21,22 @@ pub const BusType = enum {
 
 /// Represents a connection to a D-Bus bus (session or system).
 /// Manages message sending, receiving, and object registration.
+///
+/// ## Concurrency model
+///
+/// `Connection` is **single-owner for the read/dispatch path**: only one task
+/// should call `waitOnHandle`, `dispatchOnce`, `waitMessage`, or `methodCall`
+/// at a time.
+///
+/// The **send path** (`sendMessage`, `sendReply`, `sendError`, `triggerSignal`)
+/// is internally serialized by `send_mutex`.  This means it is safe for a
+/// second task to call `Signal.trigger` (which delegates to `triggerSignal`)
+/// while the main loop is serving incoming method calls — their serial
+/// allocations and socket writes will not race.
+///
+/// Outbound synchronous `methodCall` (which both writes *and* then reads a
+/// reply) must still be owned by the same task that runs the dispatch loop,
+/// or fully protected externally, because it reads from the socket.
 pub const Connection = struct {
     io: std.Io,
     __inner_sock: net.Stream,
@@ -28,6 +44,9 @@ pub const Connection = struct {
     __reader_buf: []u8,
     __reader: std.Io.net.Stream.Reader,
     serial_counter: u32 = 1,
+    /// Serializes serial allocation and socket writes for the send path.
+    /// Held only for the duration of a single message send.
+    send_mutex: std.Thread.Mutex = .{},
     pending_messages: std.ArrayList(core.Message),
     signal_handlers: std.ArrayList(common.SignalHandler),
     registered_interfaces: std.ArrayList(common.InterfaceWrapper),
@@ -233,17 +252,26 @@ pub const Connection = struct {
         }
     }
 
+    /// Low-level socket write.  Caller MUST hold `send_mutex`.
+    fn sendBytesLocked(self: *Connection, bytes: []const u8) !void {
+        var writer_buffer: [2048]u8 = undefined;
+        var writer = self.__inner_sock.writer(self.io, &writer_buffer);
+        var io_writer = &writer.interface;
+        try io_writer.writeAll(bytes);
+        try io_writer.flush();
+    }
+
     /// Sends a D-Bus message over the connection.
+    /// Thread-safe: serializes socket writes via `send_mutex`.
+    /// The message's serial must have been allocated by the caller before
+    /// passing the message here.
     pub fn sendMessage(self: *Connection, msg: core.Message) !void {
         var bytes = try msg.pack(self.__allocator);
         defer bytes.deinit(self.__allocator);
 
-        var writer_buffer: [2048]u8 = undefined;
-        var writer = self.__inner_sock.writer(self.io, &writer_buffer);
-        var io_writer = &writer.interface;
-
-        try io_writer.writeAll(bytes.items);
-        try io_writer.flush();
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+        try self.sendBytesLocked(bytes.items);
     }
 
     /// Registers an object (interface implementation) at a specific path.
@@ -280,6 +308,7 @@ pub const Connection = struct {
             .interface_name = interface_name,
             .path = path,
             .intro_xml = intro_xml,
+            .type_name = @typeName(T),
             .destroy = struct {
                 fn destroy(w: *const common.InterfaceWrapper, alloc: std.mem.Allocator) void {
                     const self_ptr = @as(*T, @ptrCast(@alignCast(w.instance)));
@@ -294,8 +323,31 @@ pub const Connection = struct {
         return self.registered_interfaces.items.len - 1;
     }
 
+    /// Returns a typed pointer to the registered object instance for `handle`.
+    ///
+    /// Use this after `registerObject` to retrieve the live object so you can
+    /// read/write its fields or call `Signal.trigger` from outside a method
+    /// handler.
+    ///
+    /// Safety: the returned pointer is valid until `close()` is called.
+    /// Do **not** access it concurrently with the dispatch loop without
+    /// external synchronization — only signal emission via `Signal.trigger`
+    /// (which goes through `triggerSignal`) is internally serialized.
+    ///
+    /// Errors:
+    ///   `error.InvalidHandle`   — `handle` is out of range.
+    ///   `error.WrongObjectType` — the handle was registered with a different type `T`.
+    pub fn getRegisteredObject(self: *Connection, comptime T: type, handle: usize) error{ InvalidHandle, WrongObjectType }!*T {
+        if (handle >= self.registered_interfaces.items.len) return error.InvalidHandle;
+        const wrapper = &self.registered_interfaces.items[handle];
+        if (!std.mem.eql(u8, wrapper.type_name, @typeName(T))) return error.WrongObjectType;
+        return @as(*T, @ptrCast(@alignCast(wrapper.instance)));
+    }
+
     /// Sends a reply to a method call.
+    /// Thread-safe: serial allocation and socket write are protected by `send_mutex`.
     pub fn sendReply(self: *Connection, m: core.Message, enc: message.BodyEncoder) !void {
+        // Build the header fields outside the lock (allocation is fine without it).
         var reply_fields = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, 3);
         defer {
             for (reply_fields.items) |f| {
@@ -319,20 +371,31 @@ pub const Connection = struct {
         }
         try reply_fields.append(self.__allocator, .{ .code = .Signature, .value = .{ .Signature = try self.__allocator.dupeZ(u8, enc.signature()) } });
 
+        // Atomically allocate serial and send so concurrent senders get unique serials
+        // and socket writes do not interleave.
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+
+        const serial = self.serial_counter;
+        self.serial_counter += 1;
+
         const reply_h = core.MessageHeader{
             .message_type = .MethodReturn,
             .flags = 0,
             .proto_version = 1,
             .body_length = @intCast(enc.body().len),
-            .serial = self.serial_counter,
+            .serial = serial,
             .header_fields = reply_fields.items,
         };
-        self.serial_counter += 1;
-        try self.sendMessage(core.Message.new(reply_h, enc.body()));
+        var bytes = try core.Message.new(reply_h, enc.body()).pack(self.__allocator);
+        defer bytes.deinit(self.__allocator);
+        try self.sendBytesLocked(bytes.items);
     }
 
     /// Sends an Error reply to a message.
+    /// Thread-safe: serial allocation and socket write are protected by `send_mutex`.
     pub fn sendError(self: *Connection, m: core.Message, error_name: [:0]const u8, error_msg: [:0]const u8) !void {
+        // Build fields and encode body outside the lock.
         var reply_fields = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, 4);
         defer {
             for (reply_fields.items) |f| {
@@ -362,129 +425,210 @@ pub const Connection = struct {
 
         try reply_fields.append(self.__allocator, .{ .code = .Signature, .value = .{ .Signature = try self.__allocator.dupeZ(u8, encoder.signature()) } });
 
+        // Atomically allocate serial and send.
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+
+        const serial = self.serial_counter;
+        self.serial_counter += 1;
+
         const reply_h = core.MessageHeader{
             .message_type = .Error,
             .flags = 0,
             .proto_version = 1,
             .body_length = @intCast(encoder.body().len),
-            .serial = self.serial_counter,
+            .serial = serial,
             .header_fields = reply_fields.items,
         };
-        self.serial_counter += 1;
-        try self.sendMessage(core.Message.new(reply_h, encoder.body()));
+        var bytes = try core.Message.new(reply_h, encoder.body()).pack(self.__allocator);
+        defer bytes.deinit(self.__allocator);
+        try self.sendBytesLocked(bytes.items);
     }
 
-    /// Runs the main loop, blocking and handling messages for the registered objects.
-    pub fn waitOnHandle(self: *Connection, handle: usize) !void {
-        if (handle >= self.registered_interfaces.items.len) return error.InvalidHandle;
+    /// Sends a D-Bus signal with the given parameters.
+    ///
+    /// Thread-safe: serial allocation and socket write are protected by
+    /// `send_mutex`, making it safe to call from a task that is not running
+    /// the dispatch loop.  This is the function `Signal.trigger` delegates to.
+    pub fn triggerSignal(
+        self: *Connection,
+        interface: [:0]const u8,
+        path: [:0]const u8,
+        name: [:0]const u8,
+        encoder: message.BodyEncoder,
+    ) !void {
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
 
-        while (true) {
-            var msg = try self.waitMessage();
-            defer self.freeMessage(&msg);
+        const serial = self.serial_counter;
+        self.serial_counter += 1;
 
-            if (msg.header.message_type == .MethodCall) {
-                // Check interface and path
-                var iface: ?[]const u8 = null;
-                var path: ?[]const u8 = null;
-                var member: ?[]const u8 = null;
-                for (msg.header.header_fields) |f| {
-                    if (f.code == .Interface) iface = f.value.Interface;
-                    if (f.code == .Path) path = f.value.Path;
-                    if (f.code == .Member) member = f.value.Member;
-                }
+        const header = core.MessageHeader{
+            .message_type = .Signal,
+            .flags = 0,
+            .proto_version = 1,
+            .body_length = @intCast(encoder.body().len),
+            .serial = serial,
+            .header_fields = @constCast(&[_]core.HeaderField{
+                .{ .code = .Path, .value = .{ .Path = path } },
+                .{ .code = .Interface, .value = .{ .Interface = interface } },
+                .{ .code = .Member, .value = .{ .Member = name } },
+                .{ .code = .Signature, .value = .{ .Signature = encoder.signature() } },
+            }),
+        };
 
-                if (path) |p| {
-                    var handled = false;
-                    for (self.registered_interfaces.items) |*w| {
-                        // Check path first
-                        if (std.mem.eql(u8, w.path, p)) {
-                            // Then check interface or Introspectable
-                            if (iface) |i| {
-                                if (std.mem.eql(u8, w.interface_name, i) or
-                                    std.mem.eql(u8, i, "org.freedesktop.DBus.Introspectable") or
-                                    std.mem.eql(u8, i, "org.freedesktop.DBus.Properties"))
-                                {
-                                    // Dispatch
-                                    try w.dispatch(w, self, msg);
-                                    handled = true;
-                                }
-                            } else {
-                                // Fallback dispatch
-                                try w.dispatch(w, self, msg);
-                                handled = true;
-                            }
+        var bytes = try core.Message.new(header, encoder.body()).pack(self.__allocator);
+        defer bytes.deinit(self.__allocator);
+        try self.sendBytesLocked(bytes.items);
+    }
+
+    /// Dispatches a single already-received MethodCall message to the appropriate
+    /// registered interfaces.  Non-MethodCall messages are silently ignored.
+    /// This is the internal implementation shared by `dispatchOnce` and `waitOnHandle`.
+    fn dispatchMessage(self: *Connection, msg: core.Message) !void {
+        if (msg.header.message_type != .MethodCall) return;
+
+        var iface: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        var member: ?[]const u8 = null;
+        for (msg.header.header_fields) |f| {
+            if (f.code == .Interface) iface = f.value.Interface;
+            if (f.code == .Path) path = f.value.Path;
+            if (f.code == .Member) member = f.value.Member;
+        }
+
+        if (path) |p| {
+            var handled = false;
+            for (self.registered_interfaces.items) |*w| {
+                // Check path first
+                if (std.mem.eql(u8, w.path, p)) {
+                    // Then check interface or Introspectable
+                    if (iface) |i| {
+                        if (std.mem.eql(u8, w.interface_name, i) or
+                            std.mem.eql(u8, i, "org.freedesktop.DBus.Introspectable") or
+                            std.mem.eql(u8, i, "org.freedesktop.DBus.Properties"))
+                        {
+                            // Dispatch
+                            try w.dispatch(w, self, msg);
+                            handled = true;
                         }
-                    }
-
-                    // Dynamic Introspection logic
-                    if (!handled) {
-                        if (member) |m| {
-                            if (std.mem.eql(u8, m, "Introspect") and (iface == null or std.mem.eql(u8, iface.?, "org.freedesktop.DBus.Introspectable"))) {
-                                // Check for children
-                                var children_xml = try std.ArrayList(u8).initCapacity(self.__allocator, 256);
-                                defer children_xml.deinit(self.__allocator);
-
-                                // We need a set to avoid duplicates
-                                var seen_children = std.StringHashMap(void).init(self.__allocator);
-                                defer seen_children.deinit();
-
-                                for (self.registered_interfaces.items) |*w| {
-                                    if (std.mem.startsWith(u8, w.path, p)) {
-                                        if (w.path.len > p.len) {
-                                            var child_name: []const u8 = "";
-                                            if (std.mem.eql(u8, p, "/")) {
-                                                // Special case root
-                                                if (w.path.len > 1) {
-                                                    const sub = w.path[1..];
-                                                    if (std.mem.indexOfScalar(u8, sub, '/')) |idx| {
-                                                        child_name = sub[0..idx];
-                                                    } else {
-                                                        child_name = sub;
-                                                    }
-                                                }
-                                            } else {
-                                                // Check if w.path[p.len] == '/'
-                                                if (w.path[p.len] == '/') {
-                                                    const sub = w.path[p.len + 1 ..];
-                                                    if (std.mem.indexOfScalar(u8, sub, '/')) |idx| {
-                                                        child_name = sub[0..idx];
-                                                    } else {
-                                                        child_name = sub;
-                                                    }
-                                                }
-                                            }
-
-                                            if (child_name.len > 0) {
-                                                if (seen_children.get(child_name) == null) {
-                                                    try seen_children.put(child_name, {});
-                                                    try children_xml.print(self.__allocator, "  <node name=\"{s}\"/>\n", .{child_name});
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Construct full XML
-                                var full_xml = try std.ArrayList(u8).initCapacity(self.__allocator, 1024);
-                                defer full_xml.deinit(self.__allocator);
-                                try full_xml.appendSlice(self.__allocator, "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"");
-                                try full_xml.appendSlice(self.__allocator, " \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n");
-                                try full_xml.appendSlice(self.__allocator, "<node>\n");
-                                try full_xml.appendSlice(self.__allocator, children_xml.items);
-                                try full_xml.appendSlice(self.__allocator, "</node>\n");
-
-                                // Send Reply
-                                const xml_slice = try full_xml.toOwnedSliceSentinel(self.__allocator, 0);
-                                defer self.__allocator.free(xml_slice);
-
-                                var encoder = try message.BodyEncoder.encode(self.__allocator, GStr.new(xml_slice));
-                                defer encoder.deinit();
-                                try self.sendReply(msg, encoder);
-                            }
-                        }
+                    } else {
+                        // Fallback dispatch
+                        try w.dispatch(w, self, msg);
+                        handled = true;
                     }
                 }
             }
+
+            // Dynamic Introspection logic
+            if (!handled) {
+                if (member) |m| {
+                    if (std.mem.eql(u8, m, "Introspect") and (iface == null or std.mem.eql(u8, iface.?, "org.freedesktop.DBus.Introspectable"))) {
+                        // Check for children
+                        var children_xml = try std.ArrayList(u8).initCapacity(self.__allocator, 256);
+                        defer children_xml.deinit(self.__allocator);
+
+                        // We need a set to avoid duplicates
+                        var seen_children = std.StringHashMap(void).init(self.__allocator);
+                        defer seen_children.deinit();
+
+                        for (self.registered_interfaces.items) |*w| {
+                            if (std.mem.startsWith(u8, w.path, p)) {
+                                if (w.path.len > p.len) {
+                                    var child_name: []const u8 = "";
+                                    if (std.mem.eql(u8, p, "/")) {
+                                        // Special case root
+                                        if (w.path.len > 1) {
+                                            const sub = w.path[1..];
+                                            if (std.mem.indexOfScalar(u8, sub, '/')) |idx| {
+                                                child_name = sub[0..idx];
+                                            } else {
+                                                child_name = sub;
+                                            }
+                                        }
+                                    } else {
+                                        // Check if w.path[p.len] == '/'
+                                        if (w.path[p.len] == '/') {
+                                            const sub = w.path[p.len + 1 ..];
+                                            if (std.mem.indexOfScalar(u8, sub, '/')) |idx| {
+                                                child_name = sub[0..idx];
+                                            } else {
+                                                child_name = sub;
+                                            }
+                                        }
+                                    }
+
+                                    if (child_name.len > 0) {
+                                        if (seen_children.get(child_name) == null) {
+                                            try seen_children.put(child_name, {});
+                                            try children_xml.print(self.__allocator, "  <node name=\"{s}\"/>\n", .{child_name});
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Construct full XML
+                        var full_xml = try std.ArrayList(u8).initCapacity(self.__allocator, 1024);
+                        defer full_xml.deinit(self.__allocator);
+                        try full_xml.appendSlice(self.__allocator, "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"");
+                        try full_xml.appendSlice(self.__allocator, " \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n");
+                        try full_xml.appendSlice(self.__allocator, "<node>\n");
+                        try full_xml.appendSlice(self.__allocator, children_xml.items);
+                        try full_xml.appendSlice(self.__allocator, "</node>\n");
+
+                        // Send Reply
+                        const xml_slice = try full_xml.toOwnedSliceSentinel(self.__allocator, 0);
+                        defer self.__allocator.free(xml_slice);
+
+                        var encoder = try message.BodyEncoder.encode(self.__allocator, GStr.new(xml_slice));
+                        defer encoder.deinit();
+                        try self.sendReply(msg, encoder);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads one message from the bus and dispatches it, then returns.
+    ///
+    /// This is the building block for application-owned event loops.  Unlike
+    /// `waitOnHandle` (which loops forever), `dispatchOnce` returns after
+    /// handling a single message, so the caller can interleave other work —
+    /// e.g. draining a command queue or checking cancellation flags — between
+    /// calls.
+    ///
+    /// `handle` must be a valid handle returned by `registerObject`.
+    /// The function blocks until at least one message is available.
+    ///
+    /// Note: `dispatchMessage` dispatches the incoming message to **all**
+    /// registered interfaces whose path matches — not just the one identified
+    /// by `handle`.  The `handle` parameter is only used to validate that at
+    /// least one object has been registered before entering the loop.
+    ///
+    /// Typical usage:
+    /// ```zig
+    /// while (running) {
+    ///     try conn.dispatchOnce(handle);
+    ///     // ... check queue, emit pending signals, etc. ...
+    /// }
+    /// ```
+    pub fn dispatchOnce(self: *Connection, handle: usize) !void {
+        if (handle >= self.registered_interfaces.items.len) return error.InvalidHandle;
+        var msg = try self.waitMessage();
+        defer self.freeMessage(&msg);
+        try self.dispatchMessage(msg);
+    }
+
+    /// Runs the main loop, blocking and handling messages for the registered objects.
+    /// Calls `dispatchOnce` in an infinite loop for backwards compatibility.
+    pub fn waitOnHandle(self: *Connection, handle: usize) !void {
+        // Validate the handle once up front; dispatchOnce also validates it
+        // on each iteration, but the initial check here gives an early error
+        // before blocking on the first message read.
+        if (handle >= self.registered_interfaces.items.len) return error.InvalidHandle;
+        while (true) {
+            try self.dispatchOnce(handle);
         }
     }
 

@@ -161,6 +161,81 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+#### Retrieving the registered object
+
+`registerObject` returns a `usize` handle.  Use `getRegisteredObject` to get a
+typed `*T` pointer to the live instance — for example to emit signals from
+outside a method handler:
+
+```zig
+const handle = try conn.registerObject(MyInterface, "com.example.MyService", "/com/example/MyObject", {});
+
+// Obtain a typed pointer to the registered object.
+const obj: *MyInterface = try conn.getRegisteredObject(MyInterface, handle);
+
+// Trigger a signal from anywhere you have access to `obj` and `conn`.
+try obj.Tick.trigger(&conn, 42);
+```
+
+#### Application-owned event loop with `dispatchOnce`
+
+`waitOnHandle` runs an infinite loop and never returns.  `dispatchOnce` lets
+you own the loop and interleave other work between message dispatches:
+
+```zig
+while (running.load(.acquire)) {
+    // Block until one D-Bus message is received and dispatched.
+    try conn.dispatchOnce(handle);
+
+    // Drain an application-level queue, check timers, etc.
+    while (signal_queue.pop()) |value| {
+        try obj.Tick.trigger(&conn, value);
+    }
+}
+```
+
+### Concurrency model
+
+`Connection` has a **split ownership** model:
+
+| Path | Thread-safety |
+|------|--------------|
+| **Read / dispatch** (`dispatchOnce`, `waitOnHandle`, `waitMessage`, `methodCall`) | **Single-owner**: only one task must drive this path at a time. |
+| **Send** (`sendMessage`, `sendReply`, `sendError`, `Signal.trigger`) | **Internally serialized** by an internal mutex (`send_mutex`).  Safe to call from a second task concurrently with the dispatch loop. |
+
+This means:
+
+- It is **safe** to have a background task call `Signal.trigger` while the
+  main task is running `dispatchOnce` / `waitOnHandle`.
+- It is **not safe** to call `methodCall` (which reads from the socket) from a
+  second task while the main task is dispatching.
+- If you need to emit signals from a concurrent `std.Io` task, obtain the
+  `*T` pointer via `getRegisteredObject` and call `Signal.trigger` from that
+  task.  No additional locking is required for signal emission.
+
+Example with a concurrent signal emitter:
+
+```zig
+const handle = try conn.registerObject(MyInterface, "com.example.MyService", "/com/example/MyObject", {});
+const obj: *MyInterface = try conn.getRegisteredObject(MyInterface, handle);
+
+// Spawn a background task that emits a signal every second.
+const emitter_task = try io.concurrent(struct {
+    fn run(o: *MyInterface, c: *goose.Connection) !void {
+        var tick: i32 = 0;
+        while (true) {
+            std.time.sleep(std.time.ns_per_s);
+            tick += 1;
+            try o.Tick.trigger(c, tick);  // safe: send_mutex serializes this
+        }
+    }
+}.run, .{ obj, &conn });
+_ = emitter_task;
+
+// Main task drives the dispatch loop.
+try conn.waitOnHandle(handle);
+```
+
 ## Tools
 
 Goose includes helper tools for introspection and code generation.

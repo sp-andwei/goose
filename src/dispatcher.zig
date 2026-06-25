@@ -216,25 +216,14 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                                 var sig_encoder = try message.BodyEncoder.encode(conn.__allocator, args);
                                                 defer sig_encoder.deinit();
 
-                                                const serial = conn.serial_counter;
-                                                conn.serial_counter += 1;
-
-                                                const sig_header = core.MessageHeader{
-                                                    .message_type = .Signal,
-                                                    .flags = 0,
-                                                    .proto_version = 1,
-                                                    .body_length = @intCast(sig_encoder.body().len),
-                                                    .serial = serial,
-                                                    .header_fields = @constCast(&[_]core.HeaderField{
-                                                        .{ .code = .Path, .value = .{ .Path = w.path } },
-                                                        .{ .code = .Interface, .value = .{ .Interface = "org.freedesktop.DBus.Properties" } },
-                                                        .{ .code = .Member, .value = .{ .Member = "PropertiesChanged" } },
-                                                        .{ .code = .Signature, .value = .{ .Signature = sig_encoder.signature() } },
-                                                    }),
-                                                };
-
-                                                const sig_msg = core.Message.new(sig_header, sig_encoder.body());
-                                                try conn.sendMessage(sig_msg);
+                                                // Use triggerSignal so serial allocation and send are
+                                                // atomic with respect to concurrent Signal.trigger calls.
+                                                try conn.triggerSignal(
+                                                    w.interface_name,
+                                                    w.path,
+                                                    "PropertiesChanged",
+                                                    sig_encoder,
+                                                );
                                             }
                                         }
                                     }
@@ -278,10 +267,24 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                 args[0] = self_obj;
 
                                 inline for (fn_info.params[1..], 1..) |param, i| {
-                                    args[i] = try decoder.decode(param.type.?);
+                                    args[i] = decoder.decode(param.type.?) catch {
+                                        try conn.sendError(
+                                            msg,
+                                            "org.freedesktop.DBus.Error.InvalidArgs",
+                                            "Method argument decode failed",
+                                        );
+                                        return;
+                                    };
                                 }
 
-                                const result = try @call(.auto, field_val, args);
+                                const result = @call(.auto, field_val, args) catch |err| {
+                                    try conn.sendError(
+                                        msg,
+                                        "org.freedesktop.DBus.Error.Failed",
+                                        @errorName(err),
+                                    );
+                                    return;
+                                };
                                 var encoder = try message.BodyEncoder.encode(conn.__allocator, result);
                                 defer encoder.deinit();
                                 try conn.sendReply(msg, encoder);
@@ -291,6 +294,13 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                     }
                 }
             }
+
+            // No method matched; send a standard D-Bus error so the caller gets a reply.
+            try conn.sendError(
+                msg,
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                "No such method on this interface",
+            );
         }
     }.dispatch;
 }

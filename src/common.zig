@@ -18,4 +18,7 @@ pub const InterfaceWrapper = struct {
     interface_name: [:0]const u8,
     path: [:0]const u8,
     intro_xml: [:0]const u8,
+    /// Name of the Zig type registered at this handle, obtained via `@typeName`.
+    /// Used by `getRegisteredObject` to guard against handle/type mismatches.
+    type_name: []const u8,
 };
