@@ -278,10 +278,35 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                 args[0] = self_obj;
 
                                 inline for (fn_info.params[1..], 1..) |param, i| {
-                                    args[i] = try decoder.decode(param.type.?);
+                                    args[i] = decoder.decode(param.type.?) catch |err| {
+                                        std.log.warn("D-Bus argument decode failed for {s}.{s}: {s}", .{
+                                            w.interface_name,
+                                            decl.name,
+                                            @errorName(err),
+                                        });
+                                        try conn.sendError(
+                                            msg,
+                                            "org.freedesktop.DBus.Error.InvalidArgs",
+                                            "Method argument decode failed",
+                                        );
+                                        return;
+                                    };
                                 }
 
-                                const result = try @call(.auto, field_val, args);
+                                const result = @call(.auto, field_val, args) catch |err| {
+                                    std.log.warn("D-Bus method {s}.{s} returned error: {s}", .{
+                                        w.interface_name,
+                                        decl.name,
+                                        @errorName(err),
+                                    });
+                                    try conn.sendError(
+                                        msg,
+                                        "org.freedesktop.DBus.Error.Failed",
+                                        @errorName(err),
+                                    );
+                                    return;
+                                };
+
                                 var encoder = try message.BodyEncoder.encode(conn.__allocator, result);
                                 defer encoder.deinit();
                                 try conn.sendReply(msg, encoder);
@@ -291,6 +316,13 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                     }
                 }
             }
+
+            try conn.sendError(
+                msg,
+                "org.freedesktop.DBus.Error.UnknownMethod",
+                "No such method",
+            );
+            return;
         }
     }.dispatch;
 }
