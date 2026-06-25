@@ -17,6 +17,11 @@ pub fn Signal(comptime T: type) type {
         /// Triggers a signal.
         /// `conn`: The connection to send the signal on.
         /// `payload`: The payload matching the signal's type.
+        ///
+        /// Thread-safe: delegates to `Connection.triggerSignal` which
+        /// serializes serial allocation and the socket write via an internal
+        /// mutex.  It is therefore safe to call this from a task other than
+        /// the one running the dispatch loop.
         pub fn trigger(self: *@This(), conn: *Connection, payload: T) !void {
             const interface = self.interface orelse return error.SignalNotBound;
             const path = self.path orelse return error.SignalNotBound;
@@ -24,25 +29,7 @@ pub fn Signal(comptime T: type) type {
             var encoder = try message.BodyEncoder.encode(conn.__allocator, payload);
             defer encoder.deinit();
 
-            const serial = conn.serial_counter;
-            conn.serial_counter += 1;
-
-            const header = core.MessageHeader{
-                .message_type = .Signal,
-                .flags = 0,
-                .proto_version = 1,
-                .body_length = @intCast(encoder.body().len),
-                .serial = serial,
-                .header_fields = @constCast(&[_]core.HeaderField{
-                    .{ .code = .Path, .value = .{ .Path = path } },
-                    .{ .code = .Interface, .value = .{ .Interface = interface } },
-                    .{ .code = .Member, .value = .{ .Member = self.name } },
-                    .{ .code = .Signature, .value = .{ .Signature = encoder.signature() } },
-                }),
-            };
-
-            const msg = core.Message.new(header, encoder.body());
-            try conn.sendMessage(msg);
+            try conn.triggerSignal(interface, path, self.name, encoder);
         }
     };
 }
