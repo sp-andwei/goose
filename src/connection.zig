@@ -308,6 +308,7 @@ pub const Connection = struct {
             .interface_name = interface_name,
             .path = path,
             .intro_xml = intro_xml,
+            .type_name = @typeName(T),
             .destroy = struct {
                 fn destroy(w: *const common.InterfaceWrapper, alloc: std.mem.Allocator) void {
                     const self_ptr = @as(*T, @ptrCast(@alignCast(w.instance)));
@@ -334,10 +335,12 @@ pub const Connection = struct {
     /// (which goes through `triggerSignal`) is internally serialized.
     ///
     /// Errors:
-    ///   `error.InvalidHandle` — `handle` is out of range.
-    pub fn getRegisteredObject(self: *Connection, comptime T: type, handle: usize) error{InvalidHandle}!*T {
+    ///   `error.InvalidHandle`   — `handle` is out of range.
+    ///   `error.WrongObjectType` — the handle was registered with a different type `T`.
+    pub fn getRegisteredObject(self: *Connection, comptime T: type, handle: usize) error{ InvalidHandle, WrongObjectType }!*T {
         if (handle >= self.registered_interfaces.items.len) return error.InvalidHandle;
         const wrapper = &self.registered_interfaces.items[handle];
+        if (!std.mem.eql(u8, wrapper.type_name, @typeName(T))) return error.WrongObjectType;
         return @as(*T, @ptrCast(@alignCast(wrapper.instance)));
     }
 
@@ -598,6 +601,11 @@ pub const Connection = struct {
     /// `handle` must be a valid handle returned by `registerObject`.
     /// The function blocks until at least one message is available.
     ///
+    /// Note: `dispatchMessage` dispatches the incoming message to **all**
+    /// registered interfaces whose path matches — not just the one identified
+    /// by `handle`.  The `handle` parameter is only used to validate that at
+    /// least one object has been registered before entering the loop.
+    ///
     /// Typical usage:
     /// ```zig
     /// while (running) {
@@ -615,6 +623,9 @@ pub const Connection = struct {
     /// Runs the main loop, blocking and handling messages for the registered objects.
     /// Calls `dispatchOnce` in an infinite loop for backwards compatibility.
     pub fn waitOnHandle(self: *Connection, handle: usize) !void {
+        // Validate the handle once up front; dispatchOnce also validates it
+        // on each iteration, but the initial check here gives an early error
+        // before blocking on the first message read.
         if (handle >= self.registered_interfaces.items.len) return error.InvalidHandle;
         while (true) {
             try self.dispatchOnce(handle);
